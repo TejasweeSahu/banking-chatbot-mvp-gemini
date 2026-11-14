@@ -1,0 +1,4 @@
+# Northstar is a demo bank. Account pages require sign-in and the API is private.
+User-agent: *
+Allow: /
+Disallow: /api/

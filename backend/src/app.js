@@ -1,32 +1,59 @@
 /**
- * @file backend/src/app.js
- * @description Configures the core Express application.
- * Sets up CORS, JSON body parsing, server-side mock identity injection middleware (to prevent
- * client identity spoofing), health check and demo-state endpoints, router mounts, and
- * global error handling.
+ * Express application factory. Dependencies (database, LLM) are injected so
+ * tests can run against an in-memory database and a mocked Gemini client.
  */
 
 import express from 'express';
 import cors from 'cors';
-import { MOCK_USER } from './data/mockData.js';
-import { chatRouter } from './routes/chat.js';
-import { getBalance, getCardStatus } from './services/bankingService.js';
+import helmet from 'helmet';
+import { fileURLToPath } from 'node:url';
+import { config } from './config.js';
+import { errorHandler, notFoundHandler, requestId } from './middleware/index.js';
+import { createApiRouter } from './routes/api.js';
+import { frontendDistExists, serveFrontend } from './static.js';
 
-export const app = express();
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173' }));
-app.use(express.json({ limit: '100kb' }));
+const FRONTEND_DIST = fileURLToPath(new URL('../../frontend/dist', import.meta.url));
 
-// Assessment-only mock identity. Never accept a user ID from the browser.
-app.use((req, _res, next) => {
-  req.mockUser = { id: MOCK_USER.id, name: MOCK_USER.name };
-  next();
-});
+export function createApp({ db, llm, frontendDist = config.isProduction ? FRONTEND_DIST : null }) {
+  const app = express();
+  app.disable('x-powered-by');
+  if (config.trustProxy) app.set('trust proxy', 1);
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'banking-chatbot-api' }));
-app.get('/api/demo-state', (_req, res) => res.json({ user: { name: MOCK_USER.name, accountLast4: MOCK_USER.accountLast4 }, balance: getBalance(), card: getCardStatus() }));
-app.use('/api', chatRouter);
+  app.use(requestId());
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        fontSrc: ["'self'"],
+        imgSrc: ["'self'", 'data:'],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"]
+      }
+    },
+    referrerPolicy: { policy: 'no-referrer' }
+  }));
+  app.use('/api', cors({
+    origin: (origin, cb) => cb(null, !origin || config.frontendOrigins.includes(origin)),
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'X-Requested-With', 'X-Request-Id']
+  }));
+  app.use('/api', express.json({ limit: '32kb', strict: true }));
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+  app.use('/api', createApiRouter({ db, llm }));
+  app.use('/api', notFoundHandler());
 
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled API error:', err);
-  res.status(500).json({ error: 'Unexpected server error.' });
-});
+  if (frontendDist && frontendDistExists(frontendDist)) serveFrontend(app, frontendDist);
+
+  app.use(errorHandler());
+  return app;
+}
+

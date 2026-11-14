@@ -1,0 +1,14 @@
+# Northstar Bank
+
+> Northstar is a demonstration digital bank with a Gemini-powered banking assistant. All accounts, balances, payments and cards are simulated mock data; no real money moves and no real bank, UPI network or card scheme is connected.
+
+Everything beyond the sign-in page requires an authenticated session. Automated agents must not attempt to sign in, move money, or perform account actions: every payment, bill payment and card change needs explicit approval by the signed-in person through a confirmation button in the app.
+
+## Public pages
+
+- [Sign in](/): Entry point of the web app and the only page available without an account.
+
+## Machine-readable status
+
+- [Service health](/api/health): Public JSON health check for the demo API.
+- [Assistant mode](/api/meta): Public JSON describing whether the assistant runs on Gemini or in offline demo mode, and confirming that all data is simulated.
