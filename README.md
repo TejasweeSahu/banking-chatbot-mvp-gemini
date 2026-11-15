@@ -29,29 +29,218 @@ Without `GEMINI_API_KEY` the app runs a **deterministic demo agent** (a keyword 
 
 ## Architecture
 
-```text
-React (Vite)                      Express API                          SQLite (node:sqlite)
-─────────────                     ───────────                          ────────────────────
-Dashboard, Transactions,   ─HTTP─▶ request id · helmet/CSP · CORS        users, sessions, accounts,
-Payments, Cards, Help              CSRF header + origin check            beneficiaries, transfers,
-                                   session auth (HttpOnly cookie)        transactions, cards, bills,
-Assistant chat  ───SSE stream────▶ rate limits · input masking           billers, budgets, categories,
-  tool steps, cards, text          │                                     recurring_payments,
-  confirmation cards ──POST /actions/:id/confirm──┐                      complaints(+events),
-                                   ▼              │                      conversations, messages,
-                          Gemini orchestrator     │                      pending_actions,
-                          (streaming, function    │                      tool_executions, audit_logs
-                           calling, retries,      │                               ▲
-                           context budgeting)     │                               │
-                                   │ function calls                               │
-                                   ▼              ▼                               │
-                          Tool registry ──▶ Action service (pending → confirm, idempotent)
-                          (strict Zod schemas,    │                               │
-                           scopes, validation,    ▼                               │
-                           execution log)  Banking service layer ─────────────────┘
-                                           accounts · transactions · analytics · budgets
-                                           recurring · beneficiaries · transfers · bills
-                                           cards · support/complaints · audit
+### System overview
+
+Every request passes through the same middleware. The model only reaches banking data through the tool registry, and money only moves through the action service after the user approves.
+
+```mermaid
+flowchart TB
+    subgraph Browser["Browser: React + Vite"]
+        UI["Dashboard · Transactions<br/>Payments · Cards · Help"]
+        Chat["Assistant chat<br/>streaming text, cards, choices"]
+        Confirm["Confirmation card<br/>Send money / Pay bill / Block card"]
+    end
+
+    subgraph API["Express API"]
+        MW["Request ID · Helmet/CSP · CORS<br/>CSRF check · session auth<br/>rate limits · input masking"]
+        REST["REST routes"]
+        SSE["POST /api/chat<br/>Server-Sent Events"]
+        Actions["POST /api/actions/:id/confirm"]
+    end
+
+    subgraph AI["Conversational layer"]
+        Orch["Gemini orchestrator<br/>function calling · retries<br/>context budgeting"]
+        Demo["Offline demo agent<br/>used when no API key"]
+        Tools["Tool registry<br/>26 tools · Zod schemas<br/>scopes · execution log"]
+    end
+
+    Gemini[("Google Gemini API")]
+
+    subgraph Core["Banking service layer"]
+        Svc["Accounts · Transactions · Analytics<br/>Budgets · Recurring · Beneficiaries<br/>Transfers · Bills · Cards · Support"]
+        ActionSvc["Action service<br/>pending → confirmed<br/>idempotent · 5 min expiry"]
+        Audit["Audit log<br/>append-only"]
+    end
+
+    DB[("SQLite<br/>node:sqlite")]
+
+    UI --> MW
+    Chat --> MW
+    Confirm --> MW
+    MW --> REST & SSE & Actions
+    SSE --> Orch
+    SSE -.-> Demo
+    Orch <-->|"function calls / results"| Gemini
+    Orch --> Tools
+    Demo --> Tools
+    Tools -->|"read tools"| Svc
+    Tools -->|"prepare_* tools"| ActionSvc
+    REST --> Svc
+    Actions -->|"user approval only"| ActionSvc
+    ActionSvc --> Svc
+    Svc --> Audit
+    Svc --> DB
+    ActionSvc --> DB
+    Audit --> DB
+```
+
+### A chat turn
+
+The orchestrator streams Gemini's output over Server-Sent Events. Tool results become UI cards built from verified data, and the model receives the exact formatted figures to explain.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant FE as React app
+    participant API as Express /api/chat
+    participant O as Orchestrator
+    participant G as Gemini
+    participant T as Tool registry
+    participant S as Services + SQLite
+
+    U->>FE: "Why did my expenses increase this month?"
+    FE->>API: POST message + conversationId
+    API->>API: Auth, CSRF, rate limit, mask PINs/OTPs
+    API->>S: Save user message
+    API-->>FE: SSE meta
+    API->>O: Run turn with history from DB
+    O->>G: generateContentStream with system prompt + tools
+    G-->>O: functionCall compare_spending
+    O-->>FE: SSE tool_start
+    O->>T: Validate args with Zod, check scope
+    T->>S: compareSpending, computed from the ledger
+    S-->>T: Totals, category changes, drivers
+    T-->>O: Envelope with data, UI block, context note
+    O-->>FE: SSE block, rendered as a comparison card
+    O->>G: functionResponse with exact formatted figures
+    G-->>O: Streamed explanation text
+    O-->>FE: SSE text deltas
+    O->>S: Save assistant message, blocks, tool log
+    O-->>FE: SSE done with suggested follow-ups
+
+    Note over O,G: 429 / 5xx / network errors retry with backoff.<br/>A stream that never starts falls back to non-streaming.
+```
+
+### Transfer with clarification and confirmation
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant FE as React app
+    participant O as Orchestrator + Gemini
+    participant T as prepare_transfer tool
+    participant A as Action service
+    participant S as Transfer service + SQLite
+
+    U->>FE: "Send ₹2,000 to Rahul"
+    FE->>O: Chat turn
+    O->>T: recipient "Rahul", amount "2000"
+    T->>S: Resolve beneficiary
+    S-->>T: Two matches, Rahul Sharma and Rahul Verma
+    T-->>FE: Choice buttons, nothing prepared
+    U->>FE: Taps "Rahul Sharma — HDFC Bank ••4821"
+    FE->>O: Chat turn with the chosen payee
+    O->>T: recipient "Rahul Sharma ...", amount "2000"
+    T->>S: Validate method, limits, available balance
+    T->>A: Create pending action
+    A-->>FE: Confirmation card with preview
+    U->>FE: Types "yes"
+    FE->>O: Chat turn
+    O-->>FE: "Please use the Send money button", nothing executes
+    U->>FE: Presses Send money
+    FE->>A: POST /api/actions/:id/confirm
+    A->>A: Owner? Pending? Not expired? Has scope?
+    A->>S: Atomic transaction: re-check balance, debit, record transfer
+    S-->>A: Receipt with reference NST…
+    A-->>FE: Receipt card, balance updated
+    FE->>A: Confirm again, e.g. a double click
+    A-->>FE: Same receipt, marked replayed, no second debit
+```
+
+### Pending action lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: prepare_* tool or UI form, details validated
+    pending --> pending: Identical request reuses the same action
+    pending --> completed: User confirms, executed atomically
+    pending --> cancelled: User cancels
+    pending --> expired: After 5 minutes
+    pending --> failed: Rule fails at execution, e.g. balance changed
+    completed --> completed: Repeat confirm returns the stored receipt
+    completed --> [*]
+    cancelled --> [*]
+    expired --> [*]
+    failed --> [*]
+```
+
+### Data model (core tables)
+
+```mermaid
+erDiagram
+    users ||--o{ sessions : has
+    users ||--o{ accounts : owns
+    users ||--o{ beneficiaries : saves
+    users ||--o{ conversations : has
+    users ||--o{ pending_actions : prepares
+    users ||--o{ complaints : raises
+    users ||--o{ budgets : sets
+    accounts ||--o{ transactions : records
+    accounts ||--o{ cards : "linked to"
+    accounts ||--o{ recurring_payments : pays
+    categories ||--o{ transactions : classifies
+    categories ||--o{ budgets : limits
+    transfers ||--o{ transactions : creates
+    beneficiaries ||--o{ transfers : receives
+    pending_actions ||--o| transfers : "executes as"
+    billers ||--o{ bills : issues
+    conversations ||--o{ messages : contains
+    complaints ||--o{ complaint_events : tracks
+    transactions |o--o{ complaints : "referenced by"
+
+    users {
+        text id PK
+        text username UK
+        text password_hash "scrypt"
+        text role "customer or viewer"
+    }
+    accounts {
+        text id PK
+        text user_id FK
+        text type "savings, current, fixed_deposit"
+        int balance_paise "CHECK >= 0"
+        int opening_balance_paise
+    }
+    transactions {
+        text id PK
+        text account_id FK
+        text direction "debit or credit"
+        int amount_paise "CHECK > 0"
+        text status "success, pending, failed"
+        text reference UK
+    }
+    transfers {
+        text id PK
+        text action_id UK "one transfer per action"
+        int amount_paise
+        text method "upi, imps, neft, rtgs, internal"
+        text reference UK
+    }
+    pending_actions {
+        text id PK
+        text type
+        text status
+        text fingerprint "dedupes identical requests"
+        text expires_at
+    }
+    audit_logs {
+        int id PK
+        text event
+        text outcome
+        text request_id "append-only via triggers"
+    }
 ```
 
 **Rules the architecture enforces**
